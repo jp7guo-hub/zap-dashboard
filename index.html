@@ -340,25 +340,22 @@ async function deleteRejectedVideo(videoId) {
 // ━━━ 入札 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 async function submitBid() {
   const auction=S.selectedAuction, video=S.selectedVideo;
-  const amount=parseInt(g("bid-amount").value), playCount=parseInt(g("bid-playcount").value);
+  const amount=parseInt(g("bid-amount").value)||0, playCount=parseInt(g("bid-playcount").value);
   if(!video){toast("動画を選択してください");return;}
-  if(isNaN(amount)||!playCount){toast("入札額と回数を入力してください");return;}
-  if(amount<0){toast("0以上で入札してください");return;}
+  if(isNaN(playCount)||playCount<1){toast("再生回数を入力してください");return;}
+  if(amount<0){toast("0以上で入力してください");return;}
   if(amount<(auction.minimumBid||0)){toast(`最低入札額 ¥${auction.minimumBid} 以上`);return;}
   const now=new Date();
   if(now>=toDate(auction.endAt)){toast("入札受付は終了しています");return;}
   if(now<toDate(auction.biddingStartAt||auction.startAt)){toast("まだ入札受付開始前です");return;}
   if(S.bannedVideoIds.has(video.id)){toast("この動画は出禁です");return;}
-  // 再生数上限チェック：オークションの残りスロット数を超えられない
   const broadStart=toDate(auction.broadcastStartAt),endAt=toDate(auction.endAt);
   const totalSlots=Math.ceil((endAt-broadStart)/(SLOT_SEC*1000));
   const slotsPerPlay=Math.ceil((video.duration||SLOT_SEC)/SLOT_SEC);
   const maxPlays=Math.floor(totalSlots/slotsPerPlay);
-  if(maxPlays>0&&playCount>maxPlays){toast(`再生回数は最大${maxPlays}回までです（枚数上限）`);return;}
+  if(maxPlays>0&&playCount>maxPlays){toast(`再生回数は最大${maxPlays}回までです`);return;}
   const totalCost=amount*playCount;
   if(S.coins<totalCost){toast(`コイン不足（必要: ${totalCost} / 残: ${S.coins}）`);return;}
-  const top=getTopBid(auction.id);
-  if(top){if(amount<top.amount){toast(`現在の最高入札 ¥${top.amount} を上回る必要があります`);return;} if(amount===top.amount){toast("同額は先着優先のため無効です");return;}}
   await addDoc(collection(db,"bids"),{
     auctionId:auction.id, uid:S.user.uid, username:S.user.email.split("@")[0],
     amount, adVideoId:video.id, adUrl:r2url(video.filename),
@@ -387,7 +384,7 @@ async function banCurrentAd() {
   const np=S.nowPlaying; if(!np?.adVideoId){toast("再生中の広告がありません");return;}
   const vid=S.videos.find(v=>v.id===np.adVideoId);
   if(!confirm(`「${vid?.title||np.adVideoId}」を出禁にしますか？`)) return;
-  await setDoc(doc(db,"signages",SIGNAGE_ID),{nowPlaying:{url:"",mode:"standby",adVideoId:"",updatedAt:serverTimestamp()}},{merge:true});
+  await setDoc(doc(db,"signages",selectedSignageId||SIGNAGE_ID),{nowPlaying:{url:"",mode:"standby",adVideoId:"",updatedAt:serverTimestamp()}},{merge:true});
   await setDoc(doc(db,"bannedAds",np.adVideoId),{videoId:np.adVideoId,filename:np.filename||"",bidId:np.bidId||"",username:np.username||"",bannedAt:serverTimestamp()});
   if(np.bidId) await updateDoc(doc(db,"bids",np.bidId),{status:"banned"});
   toast("出禁にしました");
@@ -605,37 +602,87 @@ function renderSchedule() {
   }).join("");
 }
 
+// ━━━ 確率計算ユーティリティ ━━━━━━━━━━━━━━━━━━━━━
+function calcBidProbabilities(bids) {
+  const paid = bids.filter(b => (b.amount||0) > 0);
+  const pool = paid.length > 0 ? paid : bids;
+  const total = pool.reduce((s,b) => s + (b.amount||1), 0);
+  return bids.map(b => {
+    if (paid.length > 0 && (b.amount||0) === 0) return { ...b, prob: 0 };
+    const w = b.amount || 1;
+    return { ...b, prob: Math.round(w / total * 100) };
+  });
+}
+
+// SVG円グラフ生成
+function buildPieChart(slices, size=80) {
+  const colors = ['#d4a017','#00b894','#667eea','#e05050','#f59e0b','#a78bfa','#34d399'];
+  let html = `<svg width="${size}" height="${size}" viewBox="0 0 ${size} ${size}">`;
+  const cx=size/2, cy=size/2, r=size/2-2;
+  let startAngle = -Math.PI/2;
+  slices.forEach((s,i) => {
+    if(s.pct <= 0) return;
+    const angle = (s.pct/100) * 2 * Math.PI;
+    const endAngle = startAngle + angle;
+    const x1=cx+r*Math.cos(startAngle), y1=cy+r*Math.sin(startAngle);
+    const x2=cx+r*Math.cos(endAngle),   y2=cy+r*Math.sin(endAngle);
+    const large = angle > Math.PI ? 1 : 0;
+    const color = colors[i % colors.length];
+    if(s.pct >= 100) {
+      html += `<circle cx="${cx}" cy="${cy}" r="${r}" fill="${color}"/>`;
+    } else {
+      html += `<path d="M${cx},${cy} L${x1},${y1} A${r},${r} 0 ${large},1 ${x2},${y2} Z" fill="${color}"/>`;
+    }
+    startAngle = endAngle;
+  });
+  html += `</svg>`;
+  return html;
+}
+
 function renderAuctions() {
   const now=new Date();
   const active=S.auctions.filter(a=>toDate(a.endAt)>now);
-
-  // 番組表パネル（入札可能な枠）
   const el=g("auction-list"); if(!el) return;
   if(!active.length){el.innerHTML=`<div class="empty-state">開催中・予定の枠がありません</div>`;return;}
 
   el.innerHTML=active.map(a=>{
     const phase=auctionPhase(a,now);
-    const top=getTopBid(a.id);
-    const allBids=S.bids.filter(b=>b.auctionId===a.id&&b.status==="active");
+    const allBids=S.bids.filter(b=>b.auctionId===a.id&&b.status==="active"&&(b.remainingPlayCount??b.playCount??0)>0&&!S.bannedVideoIds.has(b.adVideoId));
     const canBid=["bidding","broadcasting","pause-pending"].includes(phase);
-
     const phaseCls={broadcasting:"phase-live",bidding:"phase-bid",upcoming:"phase-upcoming",paused:"phase-paused","pause-pending":"phase-paused",ended:"phase-ended"};
-    const phaseLabel={broadcasting:"● ON AIR",bidding:"入札受付中",upcoming:"開始前",paused:"一時停止",  "pause-pending":"停止予約中",ended:"終了"};
+    const phaseLabel={broadcasting:"● ON AIR",bidding:"入札受付中",upcoming:"開始前",paused:"一時停止","pause-pending":"停止予約中",ended:"終了"};
 
-    const bidRows=allBids.sort((x,y)=>{if(y.amount!==x.amount)return y.amount-x.amount;return toMillis(x.createdAt)-toMillis(y.createdAt);}).slice(0,3).map((b,i)=>{
-      const rem=b.remainingPlayCount??b.playCount??0,tot=b.playCount||1,pct=Math.round(rem/tot*100);
-      const banned=S.bannedVideoIds.has(b.adVideoId);
-      const vid=S.videos.find(v=>v.id===b.adVideoId);
-      const medals=["🥇","🥈","🥉"];
-      return `<div class="bid-row ${i===0&&!banned?"bid-row-top":""} ${banned?"bid-row-banned":""}">
-        <span class="bid-medal">${banned?"⛔":medals[i]||""}</span>
-        <span class="bid-uname">${b.username}</span>
-        <span class="bid-amount-sm">¥${b.amount.toLocaleString()}</span>
-        <span class="bid-vidtitle">${vid?.title||"—"}</span>
-        <div class="bid-prog"><div class="bid-prog-fill ${banned?"banned":""}" style="width:${pct}%"></div></div>
-        <span class="bid-rem">${banned?"出禁":`${rem}/${tot}回`}</span>
-      </div>`;
-    }).join("");
+    // 確率計算
+    const bidsWithProb = calcBidProbabilities(allBids.sort((x,y)=>(y.amount||0)-(x.amount||0)));
+
+    // 円グラフ用スライス
+    const slices = bidsWithProb.map(b => ({ pct: b.prob, name: b.username }));
+
+    // 総スロット数・想定再生回数計算
+    const broadStart=toDate(a.broadcastStartAt), endAt=toDate(a.endAt);
+    const totalSlots=Math.ceil((endAt-broadStart)/(SLOT_SEC*1000));
+
+    // 円グラフ凡例付きHTML
+    const colors=['#d4a017','#00b894','#667eea','#e05050','#f59e0b','#a78bfa','#34d399'];
+    const pieHtml = allBids.length ? `
+      <div class="bid-pie-wrap">
+        <div class="bid-pie-chart">${buildPieChart(slices)}</div>
+        <div class="bid-pie-legend">
+          ${bidsWithProb.map((b,i)=>{
+            const vid=S.videos.find(v=>v.id===b.adVideoId);
+            const slotsPerPlay=Math.ceil((vid?.duration||SLOT_SEC)/SLOT_SEC);
+            const expectedPlays = b.prob > 0 ? Math.round(totalSlots * (b.prob/100) / slotsPerPlay) : 0;
+            const banned=S.bannedVideoIds.has(b.adVideoId);
+            return `<div class="pie-leg-row${banned?" pie-leg-banned":""}">
+              <span class="pie-leg-dot" style="background:${banned?'#e05050':colors[i%colors.length]}"></span>
+              <span class="pie-leg-name">${b.username}</span>
+              <span class="pie-leg-prob">${banned?'出禁':b.prob+'%'}</span>
+              <span class="pie-leg-plays">${banned?'':`約${expectedPlays}回`}</span>
+              <span class="pie-leg-amount">¥${(b.amount||0).toLocaleString()}</span>
+            </div>`;
+          }).join("")}
+        </div>
+      </div>` : `<div style="font-size:12px;color:var(--muted2);padding:8px 16px">入札がありません</div>`;
 
     return `<div class="auction-item ${a.status==="paused"?"auction-paused":""}">
       <div class="auction-item-head">
@@ -650,10 +697,10 @@ function renderAuctions() {
       </div>
       <div class="auction-stats">
         <div class="astat"><span class="astat-val">${allBids.length}</span><span class="astat-lbl">入札数</span></div>
-        <div class="astat"><span class="astat-val ${top?"astat-top":""}">${top?"¥"+top.amount.toLocaleString():"—"}</span><span class="astat-lbl">${top?top.username:"入札なし"}</span></div>
         <div class="astat"><span class="astat-val">¥${(a.minimumBid||0).toLocaleString()}</span><span class="astat-lbl">最低入札</span></div>
+        <div class="astat"><span class="astat-val">${totalSlots}</span><span class="astat-lbl">総スロット</span></div>
       </div>
-      ${allBids.length?`<div class="bid-rows">${bidRows}</div>`:""}
+      ${pieHtml}
       ${canBid?`<div class="auction-item-foot"><button class="btn-bid" onclick="window._openBidModal('${a.id}')">⚡ 入札する</button></div>`:""}
     </div>`;
   }).join("");
@@ -735,9 +782,30 @@ function selectBidVideo(id) {
   updateBidCostHint();
 }
 function updateBidCostHint() {
-  const a=parseInt(g("bid-amount")?.value)||0,pc=parseInt(g("bid-playcount")?.value)||0,h=g("bid-cost-hint"); if(!h) return;
-  if(a&&pc){const t=a*pc,ok=S.coins>=t;h.style.color=ok?"var(--gold)":"var(--danger)";h.textContent=`合計 ${t.toLocaleString()} コイン（残高: ${S.coins.toLocaleString()}）${ok?"":"← 不足`"}`;}
-  else h.textContent="";
+  const a=parseInt(g("bid-amount")?.value)||0, pc=parseInt(g("bid-playcount")?.value)||0, h=g("bid-cost-hint"); if(!h) return;
+  if(pc>0){
+    const t=a*pc, ok=S.coins>=t;
+    h.style.color=ok?"var(--gold)":"var(--danger)";
+    h.textContent=`合計 ${t.toLocaleString()} コイン（残高: ${S.coins.toLocaleString()}）${ok?"":"← 不足"}`;
+  } else { h.textContent=""; }
+
+  // 確率プレビュー
+  const prev=g("bid-prob-preview"); if(!prev||!S.selectedAuction) return;
+  const existingBids=S.bids.filter(b=>b.auctionId===S.selectedAuction.id&&b.status==="active"&&(b.remainingPlayCount??b.playCount??0)>0&&!S.bannedVideoIds.has(b.adVideoId));
+  const myBid={amount:a,username:"あなた",_me:true};
+  const allWithMe=[...existingBids, myBid];
+  const withProb=calcBidProbabilities(allWithMe);
+  const me=withProb.find(b=>b._me);
+  if(!me){prev.style.display="none";return;}
+
+  const broadStart=toDate(S.selectedAuction.broadcastStartAt),endAt=toDate(S.selectedAuction.endAt);
+  const totalSlots=Math.ceil((endAt-broadStart)/(SLOT_SEC*1000));
+  const vid=S.selectedVideo;
+  const slotsPerPlay=Math.ceil((vid?.duration||SLOT_SEC)/SLOT_SEC);
+  const expectedPlays=me.prob>0?Math.round(totalSlots*(me.prob/100)/slotsPerPlay):0;
+
+  prev.style.display="block";
+  prev.innerHTML=`<span style="color:var(--gold2);font-weight:600">推定確率 ${me.prob}%</span> · 想定再生 約${expectedPlays}回 / ${totalSlots}スロット`;
 }
 
 function switchVideoTab(name) {
@@ -1183,6 +1251,19 @@ body{background:var(--bg);background-image:radial-gradient(ellipse 80% 50% at 50
 .trim-thumb{position:absolute;width:16px;height:28px;background:var(--gold);border-radius:4px;transform:translateX(-50%);cursor:ew-resize;top:0;}
 .trim-thumb:hover{background:var(--gold2);}
 
+/* ─── PIE CHART ─── */
+.bid-pie-wrap{display:flex;align-items:flex-start;gap:16px;padding:12px 16px;border-top:1px solid var(--border);}
+.bid-pie-chart{flex-shrink:0;}
+.bid-pie-legend{flex:1;display:flex;flex-direction:column;gap:6px;}
+.pie-leg-row{display:grid;grid-template-columns:10px 1fr 36px 52px 60px;align-items:center;gap:8px;font-size:12px;}
+.pie-leg-row.pie-leg-banned{opacity:.4;}
+.pie-leg-dot{width:10px;height:10px;border-radius:50%;flex-shrink:0;}
+.pie-leg-name{font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.pie-leg-prob{font-family:var(--mono);color:var(--gold2);font-weight:600;text-align:right;}
+.pie-leg-plays{font-size:11px;color:var(--teal);text-align:right;}
+.pie-leg-amount{font-family:var(--mono);color:var(--muted2);font-size:11px;text-align:right;}
+.bid-prob-preview{font-size:12px;color:var(--muted2);margin-top:6px;padding:6px 10px;background:var(--bg3);border-radius:6px;border:1px solid var(--border);}
+
 /* ─── SIGNAGE SELECTOR ─── */
 .signage-sel-wrap{max-width:600px;margin:60px auto;padding:24px;}
 .signage-sel-title{font-family:var(--display);font-size:28px;letter-spacing:3px;color:var(--gold2);margin-bottom:24px;}
@@ -1401,10 +1482,11 @@ body{background:var(--bg);background-image:radial-gradient(ellipse 80% 50% at 50
     </div>
     <div class="mf"><label>再生回数</label><input type="number" id="bid-playcount" placeholder="例：10" min="1" oninput="updateBidCostHint()"></div>
     <div class="mf">
-      <label>入札額（¥ / 1回再生あたり）</label>
+      <label>入札額（¥ / 1回再生あたり）— 0円でも入札可</label>
       <input type="number" id="bid-amount" placeholder="0" min="0" oninput="updateBidCostHint()">
-      <small>0円から入札可 · 同額は先着優先</small>
+      <small>金額に比例した確率でローテーション再生されます</small>
       <div class="cost-hint" id="bid-cost-hint"></div>
+      <div class="bid-prob-preview" id="bid-prob-preview" style="display:none"></div>
     </div>
     <div class="modal-actions">
       <button class="btn btn-primary" style="flex:1" onclick="submitBid()">⚡ 入札する</button>
